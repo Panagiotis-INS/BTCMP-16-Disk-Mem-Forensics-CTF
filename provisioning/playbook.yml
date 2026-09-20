@@ -103,19 +103,65 @@
         mode: "0755"
 
     # ─── disk-forensics toolkit (native Linux) ───────────────────────
-    - name: Install disk-forensics toolkit (Sleuth Kit, Autopsy, ewf-tools, hivex)
+    # Noble dropped autopsy, bulk-extractor and never shipped regripper — those
+    # are installed from source/git in the tasks that follow.
+    - name: Install disk-forensics toolkit (Sleuth Kit, ewf-tools, hivex)
       ansible.builtin.apt:
         name:
           - sleuthkit
-          - autopsy
           - ewf-tools
           - libewf-dev
           - libhivex-bin
-          - guestmount
+          - libguestfs-tools
           - foremost
-          - bulk-extractor
-          - regripper
         state: present
+
+    - name: Install bulk-extractor build dependencies
+      ansible.builtin.apt:
+        name:
+          - git
+          - build-essential
+          - autoconf
+          - automake
+          - libtool
+          - pkg-config
+          - flex
+          - libssl-dev
+          - libexpat1-dev
+          - zlib1g-dev
+        state: present
+
+    - name: Clone bulk-extractor
+      ansible.builtin.git:
+        repo: https://github.com/simsong/bulk_extractor.git
+        dest: /opt/bulk_extractor
+        version: master
+        force: false
+
+    - name: Build and install bulk-extractor
+      ansible.builtin.shell: |
+        set -eu
+        cd /opt/bulk_extractor
+        bash bootstrap.sh
+        ./configure --prefix=/usr/local
+        make -j"$(nproc)"
+        make install
+      args:
+        creates: /usr/local/bin/bulk_extractor
+
+    - name: Clone RegRipper 3.0 into /opt/regripper
+      ansible.builtin.git:
+        repo: https://github.com/keydet89/RegRipper3.0.git
+        dest: /opt/regripper
+        version: master
+        force: false
+
+    - name: Symlink rip.pl as /usr/local/bin/regripper
+      ansible.builtin.file:
+        src: /opt/regripper/rip.pl
+        dest: /usr/local/bin/regripper
+        state: link
+        force: true
 
     # ─── memory-forensics toolkit build deps ─────────────────────────
     - name: Install git and Python 2.7 build dependencies
