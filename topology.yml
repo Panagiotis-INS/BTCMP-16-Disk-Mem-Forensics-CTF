@@ -1,0 +1,58 @@
+# BTCMP-16 "Disk + Memory Forensics CTF" — two analyst workstations on one range.
+#   XAVM — Xubuntu Analyst VM  (Volatility 2/3 + Sleuth Kit + Autopsy stack for Linux)
+#   WAVM — Windows Analyst VM  (Registry Explorer, FTK Imager, Autopsy, Linux Reader)
+# Both mount the shared evidence store //cybersec.upatras.gr/btcmp16 read-only.
+name: btcmp16-disk-mem-forensics-main
+hosts:
+  - name: xavm                            # Xubuntu analyst workstation
+    # c{cpu}_r{ramGB}_d{diskGB}. c4_r8_d60 matches the proven Mem-For2 build:
+    # 4 vCPU, 8 GB RAM, 60 GB root — enough headroom for Volatility 3 on ~4 GB dumps
+    # plus Autopsy indexing a small E01 in parallel.
+    flavor: c4_r8_d60
+    base_box:
+      image: xubuntu-noble-x86_64
+      mgmt_user: ubuntu
+      mgmt_protocol: ssh
+    hidden: false
+    volumes:
+      - size: 64                          # extra 64 GB scratch volume for case work
+  - name: wavm                            # Windows 10 analyst workstation
+    flavor: c4_r8_d60
+    base_box:
+      # windows-10-x86_64 — the DF-5 build proved windows-11-x86_64 fails the
+      # platform reachability gate (WinRM listener never came up in time).
+      # Keep this as windows-10 unless the platform image list changes.
+      image: windows-10-x86_64
+      mgmt_user: windows
+      # mgmt_protocol: winrm is REQUIRED — the platform only injects the
+      # PSRP/WinRM-HTTPS connection config when this key is set.
+      mgmt_protocol: winrm
+    hidden: false
+routers:
+  - name: router
+    flavor: standard.small
+    base_box:
+      image: debian-12-x86_64
+      mgmt_user: debian
+      mgmt_protocol: ssh
+    hidden: false
+networks:
+  - name: access-switch
+    cidr: 10.10.10.0/24
+    accessible_by_user: true
+    hidden: false
+wan:
+  name: wan
+  cidr: 10.10.100.0/24
+net_mappings:
+  - host: xavm
+    network: access-switch
+    ip: 10.10.10.5
+  - host: wavm
+    network: access-switch
+    ip: 10.10.10.6
+router_mappings:
+  - router: router
+    network: access-switch
+    ip: 10.10.10.1
+groups: []

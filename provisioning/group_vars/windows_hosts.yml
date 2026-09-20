@@ -1,0 +1,4 @@
+# Windows hosts run PowerShell, not a POSIX shell — without this every
+# win_* task fails once the connection is up. `windows_hosts` is the group
+# name the platform's inventory uses for Windows VMs; do not rename the file.
+ansible_shell_type: powershell

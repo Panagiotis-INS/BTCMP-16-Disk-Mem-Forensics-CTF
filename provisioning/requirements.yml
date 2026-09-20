@@ -1,0 +1,21 @@
+# Roles used by playbook.yml
+# - Linux: cyberrangecz/ansible-role-user-access (creates the trainee account
+#   on xavm, taken verbatim from the Mem-For2 baseline).
+# - Windows: andpara/ansible-role-user-access-windows pinned at v1.0.0 — the
+#   only version proven to provision the platform's windows-10-x86_64 image.
+roles:
+  - name: ansible-role-user-access
+    src: https://github.com/cyberrangecz/ansible-role-user-access
+    scm: git
+    version: v1.0.0
+  - name: ansible-role-user-access-windows
+    src: https://github.com/andpara/ansible-role-user-access-windows
+    scm: git
+    version: v1.0.0
+
+# Collections supply the win_* / chocolatey / posix modules used below.
+collections:
+  - name: ansible.windows
+  - name: community.windows
+  - name: chocolatey.chocolatey
+  - name: ansible.posix

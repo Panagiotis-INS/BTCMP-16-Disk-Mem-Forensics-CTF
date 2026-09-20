@@ -1,0 +1,9 @@
+# Shared evidence store — mounted read-only on both analyst VMs. Source and
+# credentials taken from the working Mem-For2 mount task (playbook.yml).
+# ─────────────────────────────────────────────────────────────────────────
+share_host: cybersec.upatras.gr
+share_name: btcmp16
+share_user: btcmp16
+share_password: "dSf4!5GMoK8!dzGsa!e"
+share_port: 8008
+share_smb_version: "3.1.1"

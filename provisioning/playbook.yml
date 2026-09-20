@@ -1,0 +1,629 @@
+# ─────────────────────────────────────────────────────────────────────────
+#  BTCMP-16 "Disk + Memory Forensics CTF"
+#  Two analyst workstations on one range:
+#    xavm — Xubuntu Noble (Volatility 2/3, Sleuth Kit, Autopsy, RegRipper)
+#    wavm — Windows 10   (Registry Explorer, FTK Imager, Autopsy, Linux Reader)
+#  Both mount //{{ share_host }}/{{ share_name }} as the shared evidence store.
+# ─────────────────────────────────────────────────────────────────────────
+
+# ─────────────────────────────────────────────
+#  PLAY 1 — xavm (Xubuntu Noble analyst workstation)
+# ─────────────────────────────────────────────
+- name: Configure xavm (Xubuntu Analyst VM)
+  hosts: xavm
+  become: true
+  pre_tasks:
+    - name: Wait for SSH to accept connections
+      ansible.builtin.wait_for_connection:
+        delay: 0
+        sleep: 10
+        timeout: 900
+
+  roles:
+    - role: ansible-role-user-access
+      user_access_username: LocalAdmin
+      user_access_password: Password123!
+      user_access_admin: true
+      user_access_sudo: true
+    - role: ansible-role-user-access
+      user_access_username: user
+      user_access_password: 'btcmp16@admin'
+      user_access_sudo: true
+
+  tasks:
+    # ─── base tooling & desktop autologin ────────────────────────────
+    - name: Install base packages (unzip, curl, ca-certificates, terminator)
+      ansible.builtin.apt:
+        name:
+          - unzip
+          - curl
+          - ca-certificates
+          - terminator
+        state: present
+        update_cache: true
+
+    - name: Grant LocalAdmin passwordless sudo (ALL commands)
+      ansible.builtin.copy:
+        dest: /etc/sudoers.d/90-localadmin
+        content: "LocalAdmin ALL=(ALL:ALL) NOPASSWD:ALL\n"
+        owner: root
+        group: root
+        mode: "0440"
+        validate: "visudo -cf %s"
+
+    - name: Add user to desktop and hardware groups
+      ansible.builtin.user:
+        name: user
+        groups: audio,video,netdev,plugdev,cdrom,dialout,scanner,bluetooth
+        append: true
+
+    - name: Ensure LightDM config drop-in directory exists
+      ansible.builtin.file:
+        path: /etc/lightdm/lightdm.conf.d
+        state: directory
+        mode: "0755"
+
+    - name: Configure LightDM autologin for user
+      ansible.builtin.copy:
+        dest: /etc/lightdm/lightdm.conf.d/12-autologin.conf
+        content: |
+          [Seat:*]
+          autologin-user=user
+          autologin-user-timeout=0
+          user-session=xfce
+        mode: "0644"
+
+    - name: Ensure openssh-server is installed
+      ansible.builtin.apt:
+        name: openssh-server
+        state: present
+
+    - name: Allow SSH password login for user and LocalAdmin
+      ansible.builtin.copy:
+        dest: /etc/ssh/sshd_config.d/10-btcmp16.conf
+        content: |
+          PasswordAuthentication yes
+          PubkeyAuthentication yes
+          AllowUsers ubuntu user LocalAdmin
+        mode: "0644"
+      notify: Restart sshd
+
+    - name: Ensure sshd is enabled and running
+      ansible.builtin.systemd:
+        name: ssh
+        enabled: true
+        state: started
+
+    - name: Ensure LocalAdmin Desktop directory exists
+      ansible.builtin.file:
+        path: /home/LocalAdmin/Desktop
+        state: directory
+        owner: LocalAdmin
+        group: LocalAdmin
+        mode: "0755"
+
+    # ─── disk-forensics toolkit (native Linux) ───────────────────────
+    - name: Install disk-forensics toolkit (Sleuth Kit, Autopsy, ewf-tools, hivex)
+      ansible.builtin.apt:
+        name:
+          - sleuthkit
+          - autopsy
+          - ewf-tools
+          - libewf-dev
+          - libhivex-bin
+          - guestmount
+          - foremost
+          - bulk-extractor
+          - regripper
+        state: present
+
+    # ─── memory-forensics toolkit build deps ─────────────────────────
+    - name: Install git and Python 2.7 build dependencies
+      ansible.builtin.apt:
+        name:
+          - git
+          - build-essential
+          - wget
+          - zlib1g-dev
+          - libssl-dev
+          - libbz2-dev
+          - libreadline-dev
+          - libsqlite3-dev
+          - libncurses-dev
+          - libgdbm-dev
+          - libffi-dev
+          - libnss3-dev
+          - libdb-dev
+          - liblzma-dev
+          - tk-dev
+        state: present
+        update_cache: true
+
+    - name: Download Python 2.7.18 source tarball
+      ansible.builtin.get_url:
+        url: https://www.python.org/ftp/python/2.7.18/Python-2.7.18.tgz
+        dest: /tmp/Python-2.7.18.tgz
+        mode: "0644"
+
+    - name: Extract Python 2.7.18 source
+      ansible.builtin.unarchive:
+        src: /tmp/Python-2.7.18.tgz
+        dest: /tmp
+        remote_src: true
+        creates: /tmp/Python-2.7.18/configure
+
+    - name: Configure Python 2.7 build
+      ansible.builtin.command:
+        cmd: ./configure --enable-optimizations --enable-unicode=ucs4
+        chdir: /tmp/Python-2.7.18
+        creates: /tmp/Python-2.7.18/Makefile
+
+    - name: Build Python 2.7
+      ansible.builtin.command:
+        cmd: "make -j{{ ansible_processor_vcpus | default(2) }}"
+        chdir: /tmp/Python-2.7.18
+        creates: /tmp/Python-2.7.18/python
+
+    - name: Install Python 2.7 with altinstall
+      ansible.builtin.command:
+        cmd: make altinstall
+        chdir: /tmp/Python-2.7.18
+        creates: /usr/local/bin/python2.7
+
+    - name: Clean up Python 2.7 source artifacts
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: absent
+      loop:
+        - /tmp/Python-2.7.18.tgz
+        - /tmp/Python-2.7.18
+
+    - name: Download get-pip.py for Python 2.7
+      ansible.builtin.get_url:
+        url: https://bootstrap.pypa.io/pip/2.7/get-pip.py
+        dest: /tmp/get-pip.py
+        mode: "0644"
+
+    - name: Install pip for Python 2.7
+      ansible.builtin.command:
+        cmd: /usr/local/bin/python2.7 /tmp/get-pip.py
+        creates: /usr/local/bin/pip2.7
+
+    - name: Install virtualenv for Python 2.7
+      ansible.builtin.command:
+        cmd: /usr/local/bin/pip2.7 install virtualenv
+        creates: /usr/local/bin/virtualenv
+
+    - name: Ensure python3 venv and pip are installed
+      ansible.builtin.apt:
+        name:
+          - python3-venv
+          - python3-pip
+        state: present
+
+    - name: Create Volatility 2 virtualenv (Python 2.7) for LocalAdmin
+      become_user: LocalAdmin
+      ansible.builtin.command:
+        cmd: /usr/local/bin/virtualenv -p /usr/local/bin/python2.7 /home/LocalAdmin/vol2-venv
+        creates: /home/LocalAdmin/vol2-venv/bin/python
+
+    - name: Create Volatility 3 virtualenv (Python 3) for LocalAdmin
+      become_user: LocalAdmin
+      ansible.builtin.command:
+        cmd: python3 -m venv /home/LocalAdmin/vol3-venv
+        creates: /home/LocalAdmin/vol3-venv/bin/python
+
+    - name: Clone Volatility 2 repository as LocalAdmin
+      become_user: LocalAdmin
+      ansible.builtin.git:
+        repo: https://github.com/volatilityfoundation/volatility.git
+        dest: /home/LocalAdmin/volatility
+
+    - name: Upgrade pip, setuptools and wheel in Volatility 2 venv
+      become_user: LocalAdmin
+      ansible.builtin.pip:
+        name:
+          - pip
+          - setuptools
+          - wheel
+        state: latest
+        virtualenv: /home/LocalAdmin/vol2-venv
+
+    - name: Install Volatility 2 Python dependencies into vol2-venv
+      become_user: LocalAdmin
+      ansible.builtin.pip:
+        name:
+          - pycryptodome
+          - distorm3
+          - yara-python
+          - pytz
+          - openpyxl
+          - ujson
+          - Pillow
+        virtualenv: /home/LocalAdmin/vol2-venv
+
+    - name: Install Volatility 2 into vol2-venv
+      become_user: LocalAdmin
+      ansible.builtin.command:
+        cmd: /home/LocalAdmin/vol2-venv/bin/python setup.py install
+        chdir: /home/LocalAdmin/volatility
+        creates: /home/LocalAdmin/vol2-venv/bin/vol.py
+
+    - name: Clone Volatility 3 repository as LocalAdmin
+      become_user: LocalAdmin
+      ansible.builtin.git:
+        repo: https://github.com/volatilityfoundation/volatility3.git
+        dest: /home/LocalAdmin/volatility3
+
+    - name: Upgrade pip, setuptools and wheel in Volatility 3 venv
+      become_user: LocalAdmin
+      ansible.builtin.pip:
+        name:
+          - pip
+          - setuptools
+          - wheel
+        state: latest
+        virtualenv: /home/LocalAdmin/vol3-venv
+
+    - name: Install Volatility 3 requirements into vol3-venv
+      become_user: LocalAdmin
+      ansible.builtin.pip:
+        requirements: /home/LocalAdmin/volatility3/requirements.txt
+        virtualenv: /home/LocalAdmin/vol3-venv
+
+    - name: Install Volatility 3 package into vol3-venv
+      become_user: LocalAdmin
+      ansible.builtin.pip:
+        name: /home/LocalAdmin/volatility3
+        virtualenv: /home/LocalAdmin/vol3-venv
+
+    # ─── mount the shared evidence store (CIFS) ──────────────────────
+    - name: Install cifs-utils
+      ansible.builtin.apt:
+        name: cifs-utils
+        state: present
+        update_cache: true
+
+    - name: Ensure /mnt/btcmp16 mount point exists
+      ansible.builtin.file:
+        path: /mnt/btcmp16
+        state: directory
+        mode: "0755"
+
+    - name: Mount {{ share_host }} CIFS share at /mnt/btcmp16 (read-only)
+      ansible.posix.mount:
+        src: "//{{ share_host }}/{{ share_name }}"
+        path: /mnt/btcmp16
+        fstype: cifs
+        opts: "username={{ share_user }},password={{ share_password }},ro,vers={{ share_smb_version }},port={{ share_port }}"
+        state: mounted
+
+  handlers:
+    - name: Restart sshd
+      ansible.builtin.systemd:
+        name: ssh
+        state: restarted
+
+
+# ─────────────────────────────────────────────
+#  PLAY 2 — wavm (Windows 10 analyst workstation)
+# ─────────────────────────────────────────────
+- name: Configure wavm (Windows Analyst VM)
+  hosts: wavm
+  gather_facts: false
+
+  pre_tasks:
+    # Ride out the slow Windows first boot before any win_* task. Only helps
+    # AFTER the platform's own reachability gate has passed.
+    - name: Wait for the WinRM/PSRP listener to accept connections
+      ansible.builtin.wait_for_connection:
+        delay: 0
+        sleep: 10
+        timeout: 900
+
+  vars:
+    case_dir: 'C:\Cases\BTCMP16'
+    work_dir: 'C:\Cases\BTCMP16\Export'
+    tools_dir: 'C:\Tools'
+    share_drive: 'Z:'
+
+    # Registry Explorer (Eric Zimmerman) — net9 build. Framework-dependent, so
+    # dotnet-9.0-desktopruntime must be installed too.
+    regexplorer_url: 'https://download.ericzimmermanstools.com/net9/RegistryExplorer.zip'
+
+    # DiskInternals Linux Reader — reads ext2/3/4 on Windows (no WSL / no nested virt).
+    linuxreader_url: 'https://eu.diskinternals.com/download/Linux_Reader.exe'
+
+    # Autopsy 4.23.1 — direct GitHub Release MSI (Apache-2.0).
+    autopsy_msi_url: 'https://github.com/sleuthkit/autopsy/releases/download/autopsy-4.23.1/autopsy-4.23.1-64bit.msi'
+
+    # FTK Imager 8.3.0.27 — Exterro's own CDN. Checksum-pinned so a silent
+    # upstream rev fails loudly instead of installing the wrong artifact.
+    ftkimager_zip_url: 'https://d1kpmuwb7gvu1i.cloudfront.net/8.3/Imager/FTK%20Imager%208.3.0.27.zip'
+    ftkimager_zip_sha256: '0f717d0d91c94af94107775ae37c2e330cc2a2312a8eecc91a344c8010e82afe'
+    ftkimager_setup: 'Exterro_FTK_Imager_(x64).exe'
+    ftkimager_exe: 'C:\Program Files\AccessData\FTK Imager\FTK Imager.exe'
+
+  roles:
+    - name: ansible-role-user-access-windows
+      user_access_username: user
+      user_access_password: Password123
+      user_access_rdp: true
+      user_access_admin: true
+
+  tasks:
+
+    # ─── settle RDP before it can hang the play ──────────────────────
+    - name: Ensure TermService is running before the RDP handler fires
+      ansible.windows.win_service:
+        name: TermService
+        state: started
+
+    - name: Flush pending handlers now (avoids deferred RDP restart hang at end of play)
+      ansible.builtin.meta: flush_handlers
+
+    # ─── base tooling via Chocolatey ─────────────────────────────────
+    - name: Install base packages via Chocolatey
+      chocolatey.chocolatey.win_chocolatey:
+        name:
+          - 7zip
+          - git
+          - strawberryperl
+          - dotnet-9.0-desktopruntime   # Registry Explorer runtime
+        state: present
+
+    # ─── forensic tools via Chocolatey (version-agnostic, self-updating) ──
+    - name: Install FTK Imager + Autopsy via Chocolatey (fallback path)
+      chocolatey.chocolatey.win_chocolatey:
+        name:
+          - autopsy
+        state: present
+      ignore_errors: true   # if choco package is unavailable, direct install below still succeeds
+
+    # ─── Autopsy 4.23.1 (direct MSI) ────────────────────────────────
+    - name: Download Autopsy MSI
+      ansible.windows.win_get_url:
+        url: "{{ autopsy_msi_url }}"
+        dest: 'C:\Windows\Temp\autopsy.msi'
+
+    - name: Install Autopsy (silent MSI)
+      ansible.windows.win_package:
+        path: 'C:\Windows\Temp\autopsy.msi'
+        state: present
+
+    # ─── DiskInternals Linux Reader (NSIS installer, silent /S) ─────
+    - name: Download DiskInternals Linux Reader
+      ansible.windows.win_get_url:
+        url: "{{ linuxreader_url }}"
+        dest: 'C:\Windows\Temp\linux_reader_setup.exe'
+
+    - name: Install Linux Reader (silent, NSIS /S)
+      ansible.windows.win_package:
+        path: 'C:\Windows\Temp\linux_reader_setup.exe'
+        arguments: /S
+        state: present
+
+    # ─── FTK Imager 8.3.0.27 (checksum-pinned CDN download) ─────────
+    - name: Download FTK Imager 8.3 (checksum-pinned)
+      ansible.windows.win_get_url:
+        url: "{{ ftkimager_zip_url }}"
+        dest: 'C:\Windows\Temp\ftkimager.zip'
+        checksum: "{{ ftkimager_zip_sha256 }}"
+        checksum_algorithm: sha256
+
+    - name: Unzip the FTK Imager bundle
+      community.windows.win_unzip:
+        src: 'C:\Windows\Temp\ftkimager.zip'
+        dest: 'C:\Windows\Temp\ftkimager'
+        creates: 'C:\Windows\Temp\ftkimager\{{ ftkimager_setup }}'
+
+    - name: Install FTK Imager (silent InstallShield -> MSI; pulls in CodeMeter prereq)
+      ansible.windows.win_package:
+        path: 'C:\Windows\Temp\ftkimager\{{ ftkimager_setup }}'
+        arguments: '/s /v"/qn REBOOT=ReallySuppress"'
+        state: present
+        creates_path: "{{ ftkimager_exe }}"
+
+    - name: Confirm FTK Imager landed where the training text says it does
+      ansible.windows.win_stat:
+        path: "{{ ftkimager_exe }}"
+      register: ftk_installed
+
+    - name: Fail early if FTK Imager did not install
+      ansible.builtin.assert:
+        that:
+          - ftk_installed.stat.exists
+        fail_msg: >
+          FTK Imager is missing from {{ ftkimager_exe }} — the silent install did not
+          complete. Confirm CodeMeter / Bonjour / install path prompts (see FTK notes).
+
+    # ─── Defender exclusions: evidence-preservation ─────────────────
+    # DF-5.3 / 5.4 have the trainee EXPORT the USB implants out of the E01s onto
+    # disk. Inside an E01 they are inert and invisible to Defender; the instant
+    # they land as loose files Defender quarantines them and the level becomes
+    # unsolvable. Runs BEFORE the case tree exists — Add-MpPreference accepts a
+    # path that does not yet exist.
+    - name: Exclude the tool + case/working paths from Defender
+      ansible.windows.win_shell: |
+        Add-MpPreference -ExclusionPath 'C:\Program Files\AccessData'
+        Add-MpPreference -ExclusionPath '{{ case_dir }}'
+      changed_when: false
+
+    - name: Verify the exclusions actually registered
+      ansible.windows.win_powershell:
+        script: |
+          $p = (Get-MpPreference).ExclusionPath
+          if ($p -notcontains '{{ case_dir }}') {
+            throw "Defender exclusion for {{ case_dir }} is MISSING - exported evidence will be quarantined."
+          }
+          $p
+      changed_when: false
+
+    # ─── Eric Zimmerman Registry Explorer (portable ZIP) ────────────
+    - name: Create tools directory
+      ansible.windows.win_file:
+        path: "{{ tools_dir }}"
+        state: directory
+
+    - name: Download Registry Explorer
+      ansible.windows.win_get_url:
+        url: "{{ regexplorer_url }}"
+        dest: 'C:\Windows\Temp\RegistryExplorer.zip'
+
+    - name: Unzip Registry Explorer into C:\Tools
+      community.windows.win_unzip:
+        src: 'C:\Windows\Temp\RegistryExplorer.zip'
+        dest: "{{ tools_dir }}"
+
+    - name: Verify Registry Explorer landed where it is expected
+      ansible.windows.win_stat:
+        path: "{{ tools_dir }}\\RegistryExplorer\\RegistryExplorer.exe"
+      register: regexplorer_installed
+
+    - name: Assert Registry Explorer is present
+      ansible.builtin.assert:
+        that:
+          - regexplorer_installed.stat.exists
+        fail_msg: >
+          RegistryExplorer.exe is missing from {{ tools_dir }}\RegistryExplorer.
+
+    # ─── RegRipper 4.0 (git clone; needs Strawberry Perl above) ─────
+    - name: Clone RegRipper 4.0 from GitHub
+      ansible.windows.win_shell: |
+        git clone https://github.com/keydet89/RegRipper4.0.git C:\Tools\RegRipper4.0
+      args:
+        creates: C:\Tools\RegRipper4.0\rip.pl
+
+    # ─── Volatility 3 (Windows build) ───────────────────────────────
+    - name: Install Python 3 via Chocolatey
+      chocolatey.chocolatey.win_chocolatey:
+        name: python
+        state: present
+
+    - name: Install Volatility 3 via pip
+      ansible.windows.win_shell: |
+        python -m pip install --upgrade pip
+        python -m pip install volatility3
+      args:
+        creates: C:\Python312\Scripts\vol.exe
+      ignore_errors: true
+
+    # ─── desktop shortcuts for every tool ───────────────────────────
+    - name: Desktop shortcut for Registry Explorer
+      community.windows.win_shortcut:
+        src: "{{ tools_dir }}\\RegistryExplorer\\RegistryExplorer.exe"
+        dest: 'C:\Users\Public\Desktop\Registry Explorer.lnk'
+        description: 'Registry Explorer — registry hive analysis'
+
+    - name: Copy the installed tools' shortcuts onto the desktop
+      ansible.windows.win_powershell:
+        script: |
+          $ErrorActionPreference = 'Stop'
+          $desktop = 'C:\Users\Public\Desktop'
+          $roots = @(
+            "$env:ProgramData\Microsoft\Windows\Start Menu\Programs",
+            "$env:AppData\Microsoft\Windows\Start Menu\Programs"
+          ) | Where-Object { Test-Path $_ }
+          $wanted = @{
+            'Autopsy'                     = 'Autopsy*.lnk'
+            'DiskInternals Linux Reader'  = '*Linux Reader*.lnk'
+            'FTK Imager'                  = '*FTK Imager*.lnk'
+          }
+          foreach ($name in $wanted.Keys) {
+            $lnk = Get-ChildItem -Path $roots -Recurse -Filter $wanted[$name] -ErrorAction SilentlyContinue |
+                   Select-Object -First 1
+            if ($lnk) {
+              Copy-Item -LiteralPath $lnk.FullName -Destination (Join-Path $desktop "$name.lnk") -Force
+            }
+          }
+      changed_when: false
+
+    # ─── case directory tree ────────────────────────────────────────
+    - name: Create case directory tree
+      ansible.windows.win_file:
+        path: "{{ item }}"
+        state: directory
+      loop:
+        - "{{ case_dir }}"
+        - "{{ work_dir }}"
+
+    # ─── mount the shared evidence store (SMB) ──────────────────────
+    # Mirrors the CIFS mount on xavm. The Mem-For2 mount uses a non-standard
+    # SMB port ({{ share_port }}) — Windows built-in SMB client only speaks 445,
+    # so we set up a loopback portproxy (127.0.0.2:445 -> share_host:share_port)
+    # and map the drive against that loopback address. When the platform exposes
+    # SMB on 445 directly, delete the portproxy tasks and point New-SmbMapping
+    # at \\{{ share_host }}\{{ share_name }} instead.
+    - name: Store share credentials in a variable-only fact (redacted from log)
+      ansible.builtin.set_fact:
+        share_creds:
+          user: "{{ share_user }}"
+          password: "{{ share_password }}"
+      no_log: true
+
+    - name: Configure portproxy from 127.0.0.2:445 to {{ share_host }}:{{ share_port }}
+      ansible.windows.win_shell: |
+        netsh interface portproxy delete v4tov4 listenaddress=127.0.0.2 listenport=445 2>$null | Out-Null
+        netsh interface portproxy add v4tov4 `
+          listenaddress=127.0.0.2 listenport=445 `
+          connectaddress={{ share_host }} connectport={{ share_port }}
+      changed_when: false
+
+    - name: Persist a hosts entry so \\btcmp16-share\{{ share_name }} resolves to the proxy
+      ansible.windows.win_lineinfile:
+        path: 'C:\Windows\System32\drivers\etc\hosts'
+        line: "127.0.0.2 btcmp16-share"
+        state: present
+
+    - name: Map {{ share_drive }} to \\btcmp16-share\{{ share_name }} (read-only, persistent)
+      ansible.windows.win_powershell:
+        script: |
+          $ErrorActionPreference = 'Stop'
+          $u = '{{ share_creds.user }}'
+          $p = ConvertTo-SecureString '{{ share_creds.password }}' -AsPlainText -Force
+          $cred = New-Object System.Management.Automation.PSCredential($u, $p)
+          $existing = Get-SmbMapping -LocalPath '{{ share_drive }}' -ErrorAction SilentlyContinue
+          if ($existing) { Remove-SmbMapping -LocalPath '{{ share_drive }}' -Force -UpdateProfile }
+          New-SmbMapping -LocalPath '{{ share_drive }}' `
+                         -RemotePath '\\btcmp16-share\{{ share_name }}' `
+                         -UserName $u -Password '{{ share_creds.password }}' `
+                         -Persistent $true | Out-Null
+      no_log: true
+      register: smb_map
+      failed_when: false
+      changed_when: smb_map is defined and smb_map.rc is defined and smb_map.rc == 0
+
+    - name: Provisioning summary
+      ansible.builtin.debug:
+        msg: >
+          wavm ready — tools in {{ tools_dir }}, cases under {{ case_dir }},
+          shared evidence store mapped to {{ share_drive }}
+          (via 127.0.0.2:445 -> {{ share_host }}:{{ share_port }}).
+
+
+# ─────────────────────────────────────────────
+#  PLAY 3 — disable unattended apt upgrades on all Linux hosts
+# ─────────────────────────────────────────────
+- name: Disable unattended apt upgrades
+  hosts: xavm
+  become: true
+  tasks:
+    - name: Disable unattended upgrades in apt periodic config
+      ansible.builtin.copy:
+        dest: /etc/apt/apt.conf.d/20auto-upgrades
+        owner: root
+        group: root
+        mode: "0644"
+        content: |
+          APT::Periodic::Update-Package-Lists "0";
+          APT::Periodic::Unattended-Upgrade "0";
+
+    - name: Disable apt daily timers
+      ansible.builtin.systemd:
+        name: "{{ item }}"
+        state: stopped
+        enabled: false
+        masked: true
+      loop:
+        - apt-daily.timer
+        - apt-daily-upgrade.timer
