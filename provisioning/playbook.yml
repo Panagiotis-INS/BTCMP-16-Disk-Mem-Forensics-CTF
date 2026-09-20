@@ -570,7 +570,7 @@
       changed_when: false
 
     - name: Persist a hosts entry so \\btcmp16-share\{{ share_name }} resolves to the proxy
-      ansible.windows.win_lineinfile:
+      community.windows.win_lineinfile:
         path: 'C:\Windows\System32\drivers\etc\hosts'
         line: "127.0.0.2 btcmp16-share"
         state: present
