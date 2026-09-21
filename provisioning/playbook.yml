@@ -315,13 +315,7 @@
         state: latest
         virtualenv: /home/LocalAdmin/vol3-venv
 
-    - name: Install Volatility 3 requirements into vol3-venv
-      become_user: LocalAdmin
-      ansible.builtin.pip:
-        requirements: /home/LocalAdmin/volatility3/requirements.txt
-        virtualenv: /home/LocalAdmin/vol3-venv
-
-    - name: Install Volatility 3 package into vol3-venv
+    - name: Install Volatility 3 package (with pyproject.toml deps) into vol3-venv
       become_user: LocalAdmin
       ansible.builtin.pip:
         name: /home/LocalAdmin/volatility3
