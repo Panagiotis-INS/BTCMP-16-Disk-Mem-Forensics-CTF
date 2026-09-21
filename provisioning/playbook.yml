@@ -129,6 +129,10 @@
           - libssl-dev
           - libexpat1-dev
           - zlib1g-dev
+          - libre2-dev
+          - libsqlite3-dev
+          - libboost-dev
+          - uuid-dev
         state: present
 
     - name: Clone bulk-extractor
