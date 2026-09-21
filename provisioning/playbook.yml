@@ -135,7 +135,8 @@
       ansible.builtin.git:
         repo: https://github.com/simsong/bulk_extractor.git
         dest: /opt/bulk_extractor
-        force: false
+        version: main
+        force: true
 
     - name: Build and install bulk-extractor
       ansible.builtin.shell: |
@@ -152,7 +153,8 @@
       ansible.builtin.git:
         repo: https://github.com/keydet89/RegRipper3.0.git
         dest: /opt/regripper
-        force: false
+        version: master
+        force: true
 
     - name: Symlink rip.pl as /usr/local/bin/regripper
       ansible.builtin.file:
