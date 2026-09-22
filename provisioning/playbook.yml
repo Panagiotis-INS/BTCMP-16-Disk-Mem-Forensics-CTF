@@ -339,7 +339,7 @@
         src: "//{{ share_host }}/{{ share_name }}"
         path: /mnt/btcmp16
         fstype: cifs
-        opts: "username={{ share_user }},password={{ share_password }},ro,vers={{ share_smb_version }},port={{ share_port }}"
+        opts: "username={{ share_user }},password={{ share_password }},ro,vers={{ share_smb_version }},port={{ share_port }},uid=user,gid=user,forceuid,forcegid,file_mode=0755,dir_mode=0755"
         state: mounted
 
   handlers:
@@ -619,23 +619,44 @@
         line: "127.0.0.2 btcmp16-share"
         state: present
 
-    - name: Map {{ share_drive }} to \\btcmp16-share\{{ share_name }} (read-only, persistent)
-      ansible.windows.win_powershell:
-        script: |
-          $ErrorActionPreference = 'Stop'
-          $u = '{{ share_creds.user }}'
-          $p = ConvertTo-SecureString '{{ share_creds.password }}' -AsPlainText -Force
-          $cred = New-Object System.Management.Automation.PSCredential($u, $p)
-          $existing = Get-SmbMapping -LocalPath '{{ share_drive }}' -ErrorAction SilentlyContinue
-          if ($existing) { Remove-SmbMapping -LocalPath '{{ share_drive }}' -Force -UpdateProfile }
-          New-SmbMapping -LocalPath '{{ share_drive }}' `
-                         -RemotePath '\\btcmp16-share\{{ share_name }}' `
-                         -UserName $u -Password '{{ share_creds.password }}' `
-                         -Persistent $true | Out-Null
+    # NTLM auth to a hostname that resolves to a loopback IP (btcmp16-share ->
+    # 127.0.0.2) is blocked by Windows' LSA loopback check by default. Listing
+    # the hostname in BackConnectionHostNames whitelists it.
+    - name: Bypass the SMB loopback check for btcmp16-share
+      ansible.windows.win_regedit:
+        path: HKLM:\SYSTEM\CurrentControlSet\Control\Lsa\MSV1_0
+        name: BackConnectionHostNames
+        data:
+          - btcmp16-share
+        type: multistring
+        state: present
+
+    # Persistent drive mappings live in HKCU\Network\<letter> of the CALLER —
+    # if we mapped from the Ansible/WinRM session, only that admin would see
+    # Z:, not the auto-login `user`. Instead, drop a Startup .cmd under user's
+    # profile so the mapping is created under `user`'s session at every logon.
+    - name: Ensure trainee user's Startup folder exists
+      ansible.windows.win_file:
+        path: 'C:\Users\user\AppData\Roaming\Microsoft\Windows\Start Menu\Programs\Startup'
+        state: directory
+
+    - name: Drop a Startup script that maps {{ share_drive }} at every logon
+      ansible.windows.win_copy:
+        dest: 'C:\Users\user\AppData\Roaming\Microsoft\Windows\Start Menu\Programs\Startup\map-btcmp16-share.cmd'
+        content: |
+          @echo off
+          net use {{ share_drive }} 1>nul 2>nul || net use {{ share_drive }} \\btcmp16-share\{{ share_name }} /user:{{ share_creds.user }} "{{ share_creds.password }}" /persistent:yes
+        newline: crlf
       no_log: true
-      register: smb_map
+
+    - name: Also map {{ share_drive }} now for this session (best-effort)
+      ansible.windows.win_shell: |
+        $ErrorActionPreference = 'SilentlyContinue'
+        Remove-SmbMapping -LocalPath '{{ share_drive }}' -Force -UpdateProfile 2>$null | Out-Null
+        cmd /c 'net use {{ share_drive }} \\btcmp16-share\{{ share_name }} /user:{{ share_creds.user }} "{{ share_creds.password }}" /persistent:no'
+      no_log: true
       failed_when: false
-      changed_when: smb_map is defined and smb_map.rc is defined and smb_map.rc == 0
+      changed_when: false
 
     - name: Provisioning summary
       ansible.builtin.debug:
