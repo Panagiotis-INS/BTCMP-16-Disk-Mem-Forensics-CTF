@@ -388,6 +388,17 @@
     ftkimager_setup: 'Exterro_FTK_Imager_(x64).exe'
     ftkimager_exe: 'C:\Program Files\AccessData\FTK Imager\FTK Imager.exe'
 
+    # rclone + WinFSP mount the shared evidence store on {{ share_drive }}.
+    # Windows' built-in SMB client only speaks TCP/445 but the share is on
+    # TCP/{{ share_port }}; rclone's SMB backend accepts any port, so it
+    # replaces the 127.0.0.2 portproxy + LSA loopback-check + Startup .cmd
+    # dance the previous revision needed.
+    rclone_version: '1.75.1'
+    rclone_dir: 'C:\rclone'
+    rclone_exe: 'C:\rclone\rclone.exe'
+    rclone_zip_url: "https://downloads.rclone.org/v{{ rclone_version }}/rclone-v{{ rclone_version }}-windows-amd64.zip"
+    winfsp_msi_url: 'https://github.com/winfsp/winfsp/releases/download/v2.1/winfsp-2.1.25156.msi'
+
   roles:
     - name: ansible-role-user-access-windows
       user_access_username: user
@@ -415,14 +426,6 @@
           - strawberryperl
           - dotnet-9.0-desktopruntime   # Registry Explorer runtime
         state: present
-
-    # ─── forensic tools via Chocolatey (version-agnostic, self-updating) ──
-    - name: Install FTK Imager + Autopsy via Chocolatey (fallback path)
-      chocolatey.chocolatey.win_chocolatey:
-        name:
-          - autopsy
-        state: present
-      ignore_errors: true   # if choco package is unavailable, direct install below still succeeds
 
     # ─── Autopsy 4.23.1 (direct MSI) ────────────────────────────────
     - name: Download Autopsy MSI
@@ -538,20 +541,6 @@
       args:
         creates: C:\Tools\RegRipper4.0\rip.pl
 
-    # ─── Volatility 3 (Windows build) ───────────────────────────────
-    - name: Install Python 3 via Chocolatey
-      chocolatey.chocolatey.win_chocolatey:
-        name: python
-        state: present
-
-    - name: Install Volatility 3 via pip
-      ansible.windows.win_shell: |
-        python -m pip install --upgrade pip
-        python -m pip install volatility3
-      args:
-        creates: C:\Python312\Scripts\vol.exe
-      ignore_errors: true
-
     # ─── desktop shortcuts for every tool ───────────────────────────
     - name: Desktop shortcut for Registry Explorer
       community.windows.win_shortcut:
@@ -591,79 +580,75 @@
         - "{{ case_dir }}"
         - "{{ work_dir }}"
 
-    # ─── mount the shared evidence store (SMB) ──────────────────────
-    # Mirrors the CIFS mount on xavm. The Mem-For2 mount uses a non-standard
-    # SMB port ({{ share_port }}) — Windows built-in SMB client only speaks 445,
-    # so we set up a loopback portproxy (127.0.0.2:445 -> share_host:share_port)
-    # and map the drive against that loopback address. When the platform exposes
-    # SMB on 445 directly, delete the portproxy tasks and point New-SmbMapping
-    # at \\{{ share_host }}\{{ share_name }} instead.
-    - name: Store share credentials in a variable-only fact (redacted from log)
-      ansible.builtin.set_fact:
-        share_creds:
-          user: "{{ share_user }}"
-          password: "{{ share_password }}"
-      no_log: true
-
-    - name: Configure portproxy from 127.0.0.2:445 to {{ share_host }}:{{ share_port }}
-      ansible.windows.win_shell: |
-        netsh interface portproxy delete v4tov4 listenaddress=127.0.0.2 listenport=445 2>$null | Out-Null
-        netsh interface portproxy add v4tov4 `
-          listenaddress=127.0.0.2 listenport=445 `
-          connectaddress={{ share_host }} connectport={{ share_port }}
-      changed_when: false
-
-    - name: Persist a hosts entry so \\btcmp16-share\{{ share_name }} resolves to the proxy
-      community.windows.win_lineinfile:
-        path: 'C:\Windows\System32\drivers\etc\hosts'
-        line: "127.0.0.2 btcmp16-share"
-        state: present
-
-    # NTLM auth to a hostname that resolves to a loopback IP (btcmp16-share ->
-    # 127.0.0.2) is blocked by Windows' LSA loopback check by default. Listing
-    # the hostname in BackConnectionHostNames whitelists it.
-    - name: Bypass the SMB loopback check for btcmp16-share
-      ansible.windows.win_regedit:
-        path: HKLM:\SYSTEM\CurrentControlSet\Control\Lsa\MSV1_0
-        name: BackConnectionHostNames
-        data:
-          - btcmp16-share
-        type: multistring
-        state: present
-
-    # Persistent drive mappings live in HKCU\Network\<letter> of the CALLER —
-    # if we mapped from the Ansible/WinRM session, only that admin would see
-    # Z:, not the auto-login `user`. Instead, drop a Startup .cmd under user's
-    # profile so the mapping is created under `user`'s session at every logon.
-    - name: Ensure trainee user's Startup folder exists
+    # ─── mount the shared evidence store via rclone + WinFSP ────────
+    # Windows' native SMB client is locked to TCP/445 and the platform
+    # publishes {{ share_name }} on TCP/{{ share_port }}. rclone's SMB
+    # backend speaks any port and WinFSP surfaces the result as a drive
+    # letter; --network-mode is REQUIRED — without it the mount lives in
+    # the LocalSystem session-0 namespace and never appears in the user's
+    # Explorer. The obscured SMB password is derived from share_password
+    # at runtime so group_vars/all.yml stays the single source of truth.
+    - name: Ensure rclone install directory exists
       ansible.windows.win_file:
-        path: 'C:\Users\user\AppData\Roaming\Microsoft\Windows\Start Menu\Programs\Startup'
+        path: "{{ rclone_dir }}"
         state: directory
 
-    - name: Drop a Startup script that maps {{ share_drive }} at every logon
+    - name: Download rclone {{ rclone_version }} zip
+      ansible.windows.win_get_url:
+        url: "{{ rclone_zip_url }}"
+        dest: 'C:\Windows\Temp\rclone.zip'
+
+    - name: Extract rclone zip to C:\Windows\Temp
+      community.windows.win_unzip:
+        src: 'C:\Windows\Temp\rclone.zip'
+        dest: 'C:\Windows\Temp'
+        creates: "C:\\Windows\\Temp\\rclone-v{{ rclone_version }}-windows-amd64\\rclone.exe"
+
+    - name: Place rclone.exe under {{ rclone_dir }}
       ansible.windows.win_copy:
-        dest: 'C:\Users\user\AppData\Roaming\Microsoft\Windows\Start Menu\Programs\Startup\map-btcmp16-share.cmd'
-        content: |
-          @echo off
-          net use {{ share_drive }} 1>nul 2>nul || net use {{ share_drive }} \\btcmp16-share\{{ share_name }} /user:{{ share_creds.user }} "{{ share_creds.password }}" /persistent:yes
-        newline: crlf
+        src: "C:\\Windows\\Temp\\rclone-v{{ rclone_version }}-windows-amd64\\rclone.exe"
+        dest: "{{ rclone_exe }}"
+        remote_src: true
+
+    - name: Download WinFSP MSI
+      ansible.windows.win_get_url:
+        url: "{{ winfsp_msi_url }}"
+        dest: 'C:\Windows\Temp\winfsp.msi'
+
+    - name: Install WinFSP (silent, blocking)
+      ansible.windows.win_package:
+        path: 'C:\Windows\Temp\winfsp.msi'
+        arguments: '/quiet /norestart'
+        state: present
+
+    # rclone will not accept a plaintext SMB password on --smb-pass; it
+    # requires its own reversibly-obscured form.
+    - name: Obscure the SMB password with rclone
+      ansible.windows.win_command: '"{{ rclone_exe }}" obscure "{{ share_password }}"'
+      register: rclone_obscured
+      changed_when: false
       no_log: true
 
-    - name: Also map {{ share_drive }} now for this session (best-effort)
-      ansible.windows.win_shell: |
-        $ErrorActionPreference = 'SilentlyContinue'
-        Remove-SmbMapping -LocalPath '{{ share_drive }}' -Force -UpdateProfile 2>$null | Out-Null
-        cmd /c 'net use {{ share_drive }} \\btcmp16-share\{{ share_name }} /user:{{ share_creds.user }} "{{ share_creds.password }}" /persistent:no'
+    - name: Register the RcloneSMB Windows service
+      ansible.windows.win_service:
+        name: RcloneSMB
+        display_name: rclone SMB mount for BTCMP16
+        description: "Mounts \\\\{{ share_host }}\\{{ share_name }} on {{ share_drive }} via rclone + WinFSP"
+        path: >-
+          "{{ rclone_exe }}" mount :smb:/{{ share_name }} {{ share_drive }}
+          --smb-host {{ share_host }} --smb-port {{ share_port }}
+          --smb-user {{ share_user }} --smb-pass {{ rclone_obscured.stdout | trim }}
+          --network-mode --read-only --volname BTCMP16
+        start_mode: auto
+        state: started
       no_log: true
-      failed_when: false
-      changed_when: false
 
     - name: Provisioning summary
       ansible.builtin.debug:
         msg: >
           wavm ready — tools in {{ tools_dir }}, cases under {{ case_dir }},
-          shared evidence store mapped to {{ share_drive }}
-          (via 127.0.0.2:445 -> {{ share_host }}:{{ share_port }}).
+          shared evidence store mounted at {{ share_drive }}
+          via rclone :smb: -> {{ share_host }}:{{ share_port }}.
 
 
 # ─────────────────────────────────────────────
