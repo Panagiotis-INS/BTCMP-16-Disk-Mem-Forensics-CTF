@@ -425,6 +425,7 @@
           - git
           - strawberryperl
           - dotnet-9.0-desktopruntime   # Registry Explorer runtime
+          - sqlite                      # sqlite3.exe on PATH for browser History / places.sqlite
         state: present
 
     # ─── Autopsy 4.23.1 (direct MSI) ────────────────────────────────
