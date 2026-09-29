@@ -375,6 +375,12 @@
     # dotnet-9.0-desktopruntime must be installed too.
     regexplorer_url: 'https://download.ericzimmermanstools.com/net9/RegistryExplorer.zip'
 
+    # XstReader — MIT-licensed native .NET viewer for Outlook OST/PST stores.
+    # Portable ZIP, runs on the in-box .NET Framework 4.x that ships with
+    # Windows 10, so no extra runtime is required.
+    xstreader_version: '1.14'
+    xstreader_zip_url: "https://github.com/Dijji/XstReader/releases/download/v{{ xstreader_version }}/XstReader.zip"
+
     # DiskInternals Linux Reader — reads ext2/3/4 on Windows (no WSL / no nested virt).
     linuxreader_url: 'https://eu.diskinternals.com/download/Linux_Reader.exe'
 
@@ -535,6 +541,31 @@
         fail_msg: >
           RegistryExplorer.exe is missing from {{ tools_dir }}\RegistryExplorer.
 
+    # ─── XstReader (portable OST/PST viewer) ────────────────────────
+    - name: Download XstReader {{ xstreader_version }}
+      ansible.windows.win_get_url:
+        url: "{{ xstreader_zip_url }}"
+        dest: 'C:\Windows\Temp\XstReader.zip'
+
+    - name: Unzip XstReader into C:\Tools\XstReader
+      community.windows.win_unzip:
+        src: 'C:\Windows\Temp\XstReader.zip'
+        dest: "{{ tools_dir }}\\XstReader"
+
+    - name: Verify XstReader landed where it is expected
+      ansible.windows.win_stat:
+        path: "{{ tools_dir }}\\XstReader\\XstReader.exe"
+      register: xstreader_installed
+
+    - name: Assert XstReader is present
+      ansible.builtin.assert:
+        that:
+          - xstreader_installed.stat.exists
+        fail_msg: >
+          XstReader.exe is missing from {{ tools_dir }}\XstReader — check that the
+          release URL {{ xstreader_zip_url }} still exists and unpacks XstReader.exe
+          at the archive root.
+
     # ─── RegRipper 4.0 (git clone; needs Strawberry Perl above) ─────
     - name: Clone RegRipper 4.0 from GitHub
       ansible.windows.win_shell: |
@@ -548,6 +579,12 @@
         src: "{{ tools_dir }}\\RegistryExplorer\\RegistryExplorer.exe"
         dest: 'C:\Users\Public\Desktop\Registry Explorer.lnk'
         description: 'Registry Explorer — registry hive analysis'
+
+    - name: Desktop shortcut for XstReader
+      community.windows.win_shortcut:
+        src: "{{ tools_dir }}\\XstReader\\XstReader.exe"
+        dest: 'C:\Users\Public\Desktop\XstReader.lnk'
+        description: 'XstReader — open Outlook OST / PST files without Outlook'
 
     - name: Copy the installed tools' shortcuts onto the desktop
       ansible.windows.win_powershell:
